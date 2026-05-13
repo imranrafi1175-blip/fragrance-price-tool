@@ -10,9 +10,11 @@ from pathlib import Path
 
 st.set_page_config(page_title="Fragrance Price Intelligence", page_icon="🧴", layout="wide")
 
-UPLOAD_DIR = Path("/mnt/user-data/uploads")
-CLAUDE_DIR = Path("/home/claude")
-OUTPUT_DIR = Path("/mnt/user-data/outputs")
+# Use writable directories - works locally and on Streamlit Cloud
+BASE_DIR   = Path(tempfile.gettempdir()) / "fragrance_tool"
+UPLOAD_DIR = BASE_DIR / "uploads"
+CLAUDE_DIR = BASE_DIR / "claude"
+OUTPUT_DIR = BASE_DIR / "outputs"
 for d in [UPLOAD_DIR, CLAUDE_DIR, OUTPUT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -31,14 +33,27 @@ st.markdown("""<style>
 st.markdown('<div class="main-title">🧴 Fragrance Price Intelligence</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">MTZ · Nandansons · PCA · GE · PTC · 13,500+ UPCs · Instant deal scoring</div>', unsafe_allow_html=True)
 
+# Patch master_price_tool to use our writable paths
+def patch_tool_paths(tool_text):
+    """Replace hardcoded /mnt/user-data paths with our writable ones"""
+    tool_text = tool_text.replace("'/mnt/user-data/uploads'", f"'{UPLOAD_DIR}'")
+    tool_text = tool_text.replace("'/home/claude'", f"'{CLAUDE_DIR}'")
+    tool_text = tool_text.replace('/mnt/user-data/outputs/', f'{OUTPUT_DIR}/')
+    # Replace the input() prompt that would block in Streamlit
+    tool_text = tool_text.replace(
+        "answer = input(\"   Make package price? (yes/no): \").strip().lower()",
+        "answer = 'yes' if package_price else 'no'"
+    )
+    return tool_text
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📦 Wholesaler Databases")
-    st.caption("Upload once per session. Files are saved automatically.")
+    st.caption("Upload once per session. Files stay loaded.")
 
     ws_uploads = {}
     for grp, label, exts in [
-        ("MTZ",        "MTZ files (.xlsx)",           ["xlsx"]),
+        ("MTZ",        "MTZ files (.xlsx)",            ["xlsx"]),
         ("Nandansons", "Nandansons files (.xlsx/.xls)",["xlsx","xls"]),
         ("PCA",        "PCA file (.xls/.xlsx)",        ["xls","xlsx"]),
         ("GE",         "GE files (.xls/.xlsx)",        ["xls","xlsx"]),
@@ -49,24 +64,42 @@ with st.sidebar:
 
     if st.button("💾 Save & Convert Files", type="primary", use_container_width=True):
         saved = 0
-        for grp, files in ws_uploads.items():
-            for f in files:
-                dest = UPLOAD_DIR / f.name
-                dest.write_bytes(f.getvalue())
-                saved += 1
-                if f.name.endswith(".xls"):
-                    subprocess.run(
-                        ["libreoffice","--headless","--convert-to","xlsx",
-                         str(dest),"--outdir", str(CLAUDE_DIR)],
-                        capture_output=True, timeout=60
-                    )
+        with st.spinner("Saving and converting files..."):
+            for grp, files in ws_uploads.items():
+                for f in files:
+                    dest = UPLOAD_DIR / f.name
+                    dest.write_bytes(f.getvalue())
+                    saved += 1
+                    if f.name.endswith(".xls"):
+                        try:
+                            subprocess.run(
+                                ["libreoffice","--headless","--convert-to","xlsx",
+                                 str(dest),"--outdir", str(CLAUDE_DIR)],
+                                capture_output=True, timeout=60
+                            )
+                        except FileNotFoundError:
+                            # LibreOffice not available — try Python xlrd→openpyxl
+                            try:
+                                import xlrd
+                                from openpyxl import Workbook
+                                wb_xls = xlrd.open_workbook(str(dest))
+                                wb_new = Workbook(); wb_new.remove(wb_new.active)
+                                for sh in wb_xls.sheets():
+                                    ws = wb_new.create_sheet(sh.name)
+                                    for r in range(sh.nrows):
+                                        for c in range(sh.ncols):
+                                            ws.cell(r+1, c+1, sh.cell_value(r, c))
+                                out = CLAUDE_DIR / f.name.replace(".xls", ".xlsx")
+                                wb_new.save(str(out))
+                            except Exception as e:
+                                st.warning(f"⚠️ Could not convert {f.name}: {e}")
         st.success(f"✅ {saved} files saved!")
 
     st.markdown("---")
     st.caption("**Files detected:**")
     counts = {
         "MTZ":        len(list(UPLOAD_DIR.glob("MTZpricelist*.xlsx"))),
-        "Nandansons": len(list(UPLOAD_DIR.glob("Nandansons_*.xlsx"))),
+        "Nandansons": len(list(UPLOAD_DIR.glob("Nandansons_*.xlsx"))) + len(list(CLAUDE_DIR.glob("Nandansons_*.xlsx"))),
         "PCA":        len(list(CLAUDE_DIR.glob("PRICE-LIST*.xlsx"))),
         "GE":         len(list(CLAUDE_DIR.glob("GE_*.xlsx"))) + len(list(CLAUDE_DIR.glob("WHOLESALE_*.xlsx"))) + len(list(CLAUDE_DIR.glob("Ge_*.xlsx"))),
         "PTC":        len(list(UPLOAD_DIR.glob("PTC_*.xlsx"))),
@@ -74,14 +107,6 @@ with st.sidebar:
     for name, cnt in counts.items():
         st.caption(f"{'✅' if cnt > 0 else '❌'} {name}: {cnt} file(s)")
     total_files = sum(counts.values())
-
-    st.markdown("---")
-    st.subheader("📤 Upload Tool")
-    tool_file = st.file_uploader("master_price_tool.py", type=["py"], key="tool")
-    if tool_file:
-        (CLAUDE_DIR / "master_price_tool.py").write_bytes(tool_file.getvalue())
-        (OUTPUT_DIR / "master_price_tool.py").write_bytes(tool_file.getvalue())
-        st.success("✅ Tool saved!")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns([3, 1, 1])
@@ -95,17 +120,21 @@ with c3:
 
 if offer_file and st.button("🚀 Run Price Analysis", type="primary", use_container_width=True):
 
-    tool_path = CLAUDE_DIR / "master_price_tool.py"
-    if not tool_path.exists():
-        alt = OUTPUT_DIR / "master_price_tool.py"
-        if alt.exists(): shutil.copy(alt, tool_path)
-        else:
-            st.error("❌ master_price_tool.py not found — upload it in the sidebar.")
-            st.stop()
-
     if total_files == 0:
         st.error("❌ No wholesaler files found — upload them in the sidebar first.")
         st.stop()
+
+    # Load and patch master_price_tool.py from the repo directory
+    repo_tool = Path(__file__).parent / "master_price_tool.py"
+    if not repo_tool.exists():
+        st.error(f"❌ master_price_tool.py not found in repo at {repo_tool}")
+        st.stop()
+
+    # Patch paths and write to writable location
+    tool_text = repo_tool.read_text()
+    patched_text = patch_tool_paths(tool_text)
+    patched_tool = CLAUDE_DIR / "master_price_tool.py"
+    patched_tool.write_text(patched_text)
 
     # Save offer file
     offer_tmp = CLAUDE_DIR / f"tmp_offer_{offer_file.name}"
@@ -137,13 +166,12 @@ if offer_file and st.button("🚀 Run Price Analysis", type="primary", use_conta
         try:
             if str(CLAUDE_DIR) not in sys.path:
                 sys.path.insert(0, str(CLAUDE_DIR))
-            # Remove cached module to reload fresh
             if "master_price_tool" in sys.modules:
                 del sys.modules["master_price_tool"]
-            spec = importlib.util.spec_from_file_location("master_price_tool", str(tool_path))
+            spec = importlib.util.spec_from_file_location("master_price_tool", str(patched_tool))
             tool = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(tool)
-            result = tool.run(str(offer_tmp), str(output_path), package_price=do_package)
+            tool.run(str(offer_tmp), str(output_path), package_price=do_package)
             success = True
         except Exception as e:
             st.error(f"❌ Error: {e}")
@@ -154,14 +182,16 @@ if offer_file and st.button("🚀 Run Price Analysis", type="primary", use_conta
         st.markdown("---")
         st.subheader("✅ Analysis Complete!")
 
-        # Summary stats
+        # Stats
         try:
             wb_r = pd.read_excel(str(output_path), sheet_name=None)
             sheets = list(wb_r.keys())
-            matched_sheet   = [s for s in sheets if 'match' in s.lower() and 'not' not in s.lower()]
-            notfound_sheet  = [s for s in sheets if 'not' in s.lower() and 'found' in s.lower()]
-            n_matched  = len(wb_r[matched_sheet[0]])   - 4 if matched_sheet  else '?'
-            n_notfound = len(wb_r[notfound_sheet[0]])  - 4 if notfound_sheet else '?'
+            matched_sheet  = [s for s in sheets if 'match' in s.lower() and 'not' not in s.lower()]
+            notfound_sheet = [s for s in sheets if 'not' in s.lower() and 'found' in s.lower()]
+            n_matched  = len(wb_r[matched_sheet[0]])  - 4 if matched_sheet  else 0
+            n_notfound = len(wb_r[notfound_sheet[0]]) - 4 if notfound_sheet else 0
+            n_matched  = max(0, n_matched)
+            n_notfound = max(0, n_notfound)
 
             cc1, cc2, cc3 = st.columns(3)
             with cc1: st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#1B5E20">{n_matched}</div><div class="stat-label">Matched</div></div>', unsafe_allow_html=True)
@@ -171,14 +201,14 @@ if offer_file and st.button("🚀 Run Price Analysis", type="primary", use_conta
                     try:
                         df_b = pd.read_excel(str(pkg_path), sheet_name='Package Pricing', header=None)
                         banner = str(df_b.iloc[3, 0]) if len(df_b) > 3 else ''
-                        if '✅' in banner and 'Discount:' in banner:
-                            disc = banner.split('Discount:')[1].split('%')[0].strip()
-                            st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#1B5E20">{disc}%</div><div class="stat-label">Package Discount</div></div>', unsafe_allow_html=True)
-                        elif '⚠️' in banner:
-                            disc = banner.split('discount:')[1].split('%')[0].strip() if 'discount:' in banner.lower() else '?'
-                            st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:#C00000">{disc}%</div><div class="stat-label">Package Discount</div></div>', unsafe_allow_html=True)
+                        if 'Discount:' in banner or 'discount:' in banner:
+                            txt = banner.replace('discount','Discount')
+                            disc = txt.split('Discount:')[1].split('%')[0].strip()
+                            color = '#1B5E20' if '✅' in banner else '#C00000'
+                            st.markdown(f'<div class="stat-box"><div class="stat-num" style="color:{color}">{disc}%</div><div class="stat-label">Package Discount</div></div>', unsafe_allow_html=True)
                     except: pass
-        except: pass
+        except Exception as e:
+            st.warning(f"Could not parse stats: {e}")
 
         # Verdict
         if pkg_path.exists():
@@ -186,16 +216,17 @@ if offer_file and st.button("🚀 Run Price Analysis", type="primary", use_conta
                 df_b = pd.read_excel(str(pkg_path), sheet_name='Package Pricing', header=None)
                 banner = str(df_b.iloc[3, 0]) if len(df_b) > 3 else ''
                 st.markdown("")
-                if '✅' in banner:
-                    disc = banner.split('Discount:')[1].split('%')[0].strip() + '%' if 'Discount:' in banner else ''
-                    if float(disc.replace('%','').replace('+','').replace('−','-').replace('−','-')) <= -40:
-                        st.markdown(f'<div class="verdict-sharp">🟢 <strong>SHARP — Excellent deal!</strong> {disc} below market. Strong buy.</div>', unsafe_allow_html=True)
-                    elif float(disc.replace('%','').replace('+','').replace('−','-').replace('−','-')) <= -35:
-                        st.markdown(f'<div class="verdict-good">🔵 <strong>GOOD — Solid deal.</strong> {disc} below market. Worth taking.</div>', unsafe_allow_html=True)
+                if '✅' in banner and 'Discount:' in banner:
+                    disc_str = banner.split('Discount:')[1].split('%')[0].strip()
+                    disc_num = float(disc_str.replace('+','').replace('−','-'))
+                    if disc_num <= -40:
+                        st.markdown(f'<div class="verdict-sharp">🟢 <strong>SHARP — Excellent deal!</strong> {disc_str}% below market. Strong buy.</div>', unsafe_allow_html=True)
+                    elif disc_num <= -35:
+                        st.markdown(f'<div class="verdict-good">🔵 <strong>GOOD — Solid deal.</strong> {disc_str}% below market. Worth taking.</div>', unsafe_allow_html=True)
                     else:
-                        st.markdown(f'<div class="verdict-min">🟠 <strong>MINIMUM — Viable.</strong> {disc} below market. Proceed with caution.</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="verdict-min">🟠 <strong>MINIMUM — Viable.</strong> {disc_str}% below market. Proceed with caution.</div>', unsafe_allow_html=True)
                 elif '⚠️' in banner:
-                    st.markdown(f'<div class="verdict-bad">⚠️ <strong>BELOW TARGET</strong> — Package does not meet −30% minimum. Counter or negotiate.</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="verdict-bad">⚠️ <strong>BELOW TARGET</strong> — Does not meet −30% minimum. Counter or pass.</div>', unsafe_allow_html=True)
             except: pass
 
         # Downloads
